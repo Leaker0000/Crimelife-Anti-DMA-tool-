@@ -1,0 +1,419 @@
+<#
+    Copyright (C) 2023 hyper674.
+    All Rights Reserved.
+
+    Unauthorized copying, distribution, modification, or use of this file, in whole or in part,
+    is strictly prohibited without prior written consent from hyper674.
+
+    This software is proprietary and confidential. Any unauthorized reproduction, distribution,
+    or disclosure may result in legal action to the fullest extent permitted by law.
+#>
+
+<#
+.SYNOPSIS
+  3-Color DMA Detection Script + Optional Discord Webhook
+  - RED: Definite DMA cheat detected
+  - YELLOW: Possible DMA cheat detected
+  - GREEN: No DMA cheat evidence found
+
+.DESCRIPTION
+  1. Checks Secure Boot & Kernel DMA Protection.
+  2. Enumerates:
+     - Present PCI devices
+     - Hidden/removed devices
+     - Registry PCI entries
+     - SetupAPI logs
+     - Thunderbolt events
+     - EDID monitor data
+  3. Labels device/log evidence as:
+     - "CONCRETE" if both a suspicious vendor ID & cheat keyword are found
+     - "SUSPICIOUS" if partial match
+     - "NONE" otherwise
+  4. Final color logic:
+     - RED if we found "CONCRETE" OR if Kernel DMA is ON and we found any suspicious items.
+     - YELLOW if suspicious items but Kernel DMA is OFF.
+     - GREEN if no suspicious items.
+
+  After scanning, the script displays the results in the prompt.
+  You will be prompted to enter a Discord webhook URL (in plain text) to send the results.
+  If you simply press Enter, the script will skip posting and just show the results locally.
+
+.NOTES
+  - Run as Administrator for full access to device logs.
+  - Adjust $Global:SuspiciousVendors / $Global:SuspiciousKeywords as needed.
+#>
+
+[CmdletBinding()]
+param()
+
+Write-Host "`n================= DMA DETECTION SCRIPT =================" -ForegroundColor Cyan
+
+#region Global Definitions
+
+# Prompt user for a Discord webhook URL (plain text) if they want to post results.
+# If no URL is entered, the script will simply display results locally.
+$webhookUrl = Read-Host "Enter Discord webhook URL (or press Enter to skip)"
+if ($webhookUrl -and ($webhookUrl -notmatch "^https?://")) {
+    Write-Host "The webhook URL does not appear to be valid. Please ensure it starts with http(s)://" -ForegroundColor Yellow
+}
+
+# Example suspicious vendor IDs (e.g. Xilinx, Cypress, etc.)
+$Global:SuspiciousVendors = @("10EE", "04B4", "1D50", "16D0", "1209", "2E8A")
+
+# Example suspicious keywords (device names, logs, descriptions)
+$Global:SuspiciousKeywords = @(
+    "PCILeech", "Screamer", "LeechCore", "Inception", "FPGA", "DMA", "Xilinx",
+    "Capture", "Debug Bridge", "KMBox", "Kimb", "Kimbox", "Fuser",
+    "RaptorDMA", "CaptainDMA", "Squirrel"
+)
+
+# Safe vendors
+$Global:KnownSafeVendors = @("Intel", "NVIDIA", "AMD", "Realtek", "Microsoft", "Logitech", "Corsair", "Kingston", "Samsung", "ASUS", "Broadcom")
+
+#endregion
+
+#region Functions
+
+function Get-SecureBootStatus {
+    try {
+        if (Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) { return $true }
+        else { return $false }
+    } catch {
+        return $false
+    }
+}
+
+function Get-KernelDMAProtectionStatus {
+    $tempReport = "$env:TEMP\msinfo_report.txt"
+    try {
+        msinfo32 /report $tempReport | Out-Null
+        $report = Get-Content $tempReport -ErrorAction SilentlyContinue
+        Remove-Item $tempReport -Force -ErrorAction SilentlyContinue
+        foreach ($line in $report) {
+            if ($line -match "Kernel DMA Protection\s*:\s*(\S+)") {
+                $status = $matches[1].Trim()
+                if ($status -eq "Enabled") { return $true }
+                else { return $false }
+            }
+        }
+    } catch {
+        return $false
+    }
+    return $false
+}
+
+function Test-DeviceForSuspicion {
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Name,
+        [AllowEmptyString()][AllowNull()][string]$Description,
+        [AllowEmptyString()][AllowNull()][string[]]$HardwareIDs
+    )
+    # Returns "NONE", "SUSPICIOUS", or "CONCRETE"
+    if ([string]::IsNullOrWhiteSpace($Name))       { $Name = "[No Name]" }
+    if ([string]::IsNullOrWhiteSpace($Description)){ $Description = "[No Description]" }
+
+    $foundVendor  = $false
+    $foundKeyword = $false
+
+    # Check hardware IDs for suspicious vendor IDs
+    if ($HardwareIDs) {
+        foreach ($hwid in $HardwareIDs) {
+            foreach ($ven in $Global:SuspiciousVendors) {
+                if ($hwid -match "VEN_$ven") {
+                    $foundVendor = $true
+                    break
+                }
+            }
+        }
+    }
+
+    # Check name/description for suspicious keywords
+    foreach ($key in $Global:SuspiciousKeywords) {
+        if ($Name -match $key -or $Description -match $key) {
+            $foundKeyword = $true
+            break
+        }
+    }
+
+    if ($foundVendor -and $foundKeyword) {
+        return "CONCRETE"
+    }
+    elseif ($foundVendor -or $foundKeyword) {
+        return "SUSPICIOUS"
+    }
+    return "NONE"
+}
+
+function Get-SuspiciousPresentPCIDevices {
+    $devices = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($dev in $devices) {
+        $score = Test-DeviceForSuspicion -Name $dev.Name -Description $dev.Description -HardwareIDs $dev.HardwareID
+        if ($score -ne "NONE") {
+            $results += [PSCustomObject]@{
+                Device   = $dev
+                Evidence = $score
+            }
+        }
+    }
+    return $results
+}
+
+function Get-SuspiciousHiddenDevices {
+    $all = Get-PnpDevice -PresentOnly:$false -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($dev in $all) {
+        if ($dev.Status -eq "Unknown" -or $dev.Status -eq "Error") {
+            $cim = Get-CimInstance Win32_PnPEntity -Filter "DeviceID='$($dev.InstanceId.Replace('\','\\'))'" -ErrorAction SilentlyContinue
+            if ($cim) {
+                $score = Test-DeviceForSuspicion -Name $cim.Name -Description $cim.Description -HardwareIDs $cim.HardwareID
+                if ($score -ne "NONE") {
+                    $results += [PSCustomObject]@{
+                        PnpDevice = $dev
+                        CimDevice = $cim
+                        Evidence  = $score
+                    }
+                }
+            }
+        }
+    }
+    return $results
+}
+
+function Get-SuspiciousRegistryPCIDevices {
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI"
+    $results = @()
+    if (Test-Path $key) {
+        $items = Get-ChildItem $key -ErrorAction SilentlyContinue
+        foreach ($i in $items) {
+            foreach ($ven in $Global:SuspiciousVendors) {
+                if ($i.PSChildName -match "VEN_$ven") {
+                    $results += [PSCustomObject]@{
+                        RegistryKey = $i.PSPath
+                        Identifier  = $i.PSChildName
+                        Evidence    = "SUSPICIOUS"
+                    }
+                    break
+                }
+            }
+        }
+    }
+    return $results
+}
+
+function Parse-SetupAPILog {
+    # Count lines with suspicious versus definite evidence in the SetupAPI log.
+    $whitelist = @("wdma_usb", "wdmaudio.inf")
+    $logPath = "C:\Windows\Inf\setupapi.dev.log"
+
+    $suspiciousCount = 0
+    $concreteCount   = 0
+
+    if (Test-Path $logPath) {
+        $lines = Get-Content $logPath -ErrorAction SilentlyContinue
+        foreach ($line in $lines) {
+            # Skip whitelisted lines.
+            $skip = $false
+            foreach ($safe in $whitelist) {
+                if ($line -match $safe) {
+                    $skip = $true
+                    break
+                }
+            }
+            if ($skip) { continue }
+
+            # Check for vendor IDs and keywords.
+            $hasVendor = $false
+            foreach ($ven in $Global:SuspiciousVendors) {
+                if ($line -match "VEN_$ven") {
+                    $hasVendor = $true
+                    break
+                }
+            }
+            $hasKeyword = $false
+            foreach ($key in $Global:SuspiciousKeywords) {
+                if ($line -match $key) {
+                    $hasKeyword = $true
+                    break
+                }
+            }
+            if ($hasVendor -and $hasKeyword) {
+                $concreteCount++
+            } elseif ($hasVendor -or $hasKeyword) {
+                $suspiciousCount++
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        SuspiciousCount = $suspiciousCount
+        ConcreteCount   = $concreteCount
+    }
+}
+
+function Check-ThunderboltEvents {
+    $tbEvents = @()
+    try {
+        $events = Get-WinEvent -LogName "Microsoft-Windows-Thunderbolt/Operational" -ErrorAction SilentlyContinue
+        if ($events) {
+            foreach ($e in $events) {
+                if ($e.Message -match "(unauthorized|failed|blocked)") {
+                    $tbEvents += $e
+                }
+            }
+        }
+    } catch {}
+    return $tbEvents
+}
+
+function Get-EDIDData {
+    $monitors = @()
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\DISPLAY"
+    if (Test-Path $key) {
+        $items = Get-ChildItem $key -ErrorAction SilentlyContinue
+        foreach ($i in $items) {
+            foreach ($sub in Get-ChildItem $i.PSPath -ErrorAction SilentlyContinue) {
+                $dp = Get-ItemProperty -Path "$($sub.PSPath)\Device Parameters" -ErrorAction SilentlyContinue
+                if ($dp -and $dp.DeviceID) {
+                    $monitors += [PSCustomObject]@{
+                        DevicePath = $sub.PSPath
+                        DeviceID   = $dp.DeviceID
+                    }
+                }
+            }
+        }
+    }
+    return $monitors
+}
+
+#endregion
+
+#region Main Script
+
+Write-Host "`nStep 1: Security Checks..." -ForegroundColor Cyan
+
+$secureBoot = Get-SecureBootStatus
+$kernelDMA  = Get-KernelDMAProtectionStatus
+
+# Convert boolean values to "ENABLED" or "DISABLED".
+$secureBootStatus = if ($secureBoot) { "ENABLED" } else { "DISABLED" }
+$kernelDmaStatus  = if ($kernelDMA)  { "ENABLED" } else { "DISABLED/UNSUPPORTED" }
+
+if ($secureBoot) { 
+    Write-Host "  - Secure Boot: ENABLED" -ForegroundColor Green 
+} else { 
+    Write-Host "  - Secure Boot: DISABLED" -ForegroundColor Yellow 
+}
+
+if ($kernelDMA) { 
+    Write-Host "  - Kernel DMA Protection: ENABLED" -ForegroundColor Green 
+} else { 
+    Write-Host "  - Kernel DMA Protection: DISABLED/Unsupported" -ForegroundColor Yellow 
+}
+
+Write-Host "`nStep 2: Device & Log Scans..." -ForegroundColor Cyan
+
+# Scan for suspicious present PCI devices.
+$present = Get-SuspiciousPresentPCIDevices
+$presentConcrete   = $present | Where-Object { $_.Evidence -eq "CONCRETE" }
+$presentSuspicious = $present | Where-Object { $_.Evidence -eq "SUSPICIOUS" }
+Write-Host "  - Present PCI: $($present.Count) suspicious device(s)."
+
+# Scan for hidden/removed devices.
+$hidden = Get-SuspiciousHiddenDevices
+$hiddenConcrete   = $hidden | Where-Object { $_.Evidence -eq "CONCRETE" }
+$hiddenSuspicious = $hidden | Where-Object { $_.Evidence -eq "SUSPICIOUS" }
+Write-Host "  - Hidden PCI: $($hidden.Count) suspicious device(s)."
+
+# Scan registry PCI entries.
+$regPci = Get-SuspiciousRegistryPCIDevices
+Write-Host "  - Registry PCI: $($regPci.Count) suspicious entry/entries."
+
+# Parse the SetupAPI log.
+$setupInfo = Parse-SetupAPILog
+Write-Host "  - SetupAPI: $($setupInfo.SuspiciousCount + $setupInfo.ConcreteCount) total suspicious lines."
+Write-Host "    (Suspicious: $($setupInfo.SuspiciousCount), Concrete: $($setupInfo.ConcreteCount))"
+
+# Check for Thunderbolt events.
+$tbEvents = Check-ThunderboltEvents
+Write-Host "  - Thunderbolt events: $($tbEvents.Count) unauthorized/blocked."
+
+# Get EDID data.
+$edid = Get-EDIDData
+Write-Host "  - EDID monitors found: $($edid.Count)"
+
+# Summarize evidence.
+$suspiciousItems = 0
+$definiteItems   = 0
+
+$suspiciousItems += $presentSuspicious.Count
+$definiteItems   += $presentConcrete.Count
+$suspiciousItems += $hiddenSuspicious.Count
+$definiteItems   += $hiddenConcrete.Count
+$suspiciousItems += $regPci.Count
+$suspiciousItems += $setupInfo.SuspiciousCount
+$definiteItems   += $setupInfo.ConcreteCount
+if ($tbEvents.Count -gt 0) { $suspiciousItems++ }
+if ($edid.Count -gt 1)     { $suspiciousItems++ }
+
+Write-Host "`nStep 3: Determining Final Color..." -ForegroundColor Cyan
+$finalColor = "Green"  # Default
+
+if ($definiteItems -gt 0) {
+    $finalColor = "Red"
+} elseif ($suspiciousItems -gt 0) {
+    if ($kernelDMA) {
+        $finalColor = "Red"  # System is hardened but suspicious evidence found.
+    } else {
+        $finalColor = "Yellow"  # System vulnerable, possible cheat detected.
+    }
+}
+
+Write-Host "`n================= FINAL REPORT =================" -ForegroundColor Cyan
+switch ($finalColor) {
+    "Red" {
+        if ($definiteItems -gt 0) {
+            Write-Host "RED: 100% EVIDENCE OF DMA CHEAT DETECTED!" -ForegroundColor Red
+        } else {
+            Write-Host "RED: Suspicious devices found, Kernel DMA ON => Definite DMA." -ForegroundColor Red
+        }
+    }
+    "Yellow" {
+        Write-Host "YELLOW: Possible DMA cheat detected (system is vulnerable)." -ForegroundColor Yellow
+    }
+    "Green" {
+        Write-Host "GREEN: No DMA cheat evidence found." -ForegroundColor Green
+    }
+}
+
+# Build a summary message.
+$summaryMessage = "DMA Detection Summary:`n" +
+    "Final Color: $finalColor`n" +
+    "Definite Items: $definiteItems`n" +
+    "Suspicious Items: $suspiciousItems`n" +
+    "Secure Boot: $secureBootStatus`n" +
+    "Kernel DMA: $kernelDmaStatus`n" +
+    "`n" +
+    "Present PCI suspicious: $($present.Count), " +
+    "Hidden PCI suspicious: $($hidden.Count), " +
+    "Registry suspicious: $($regPci.Count), " +
+    "SetupAPI suspicious lines: $($setupInfo.SuspiciousCount + $setupInfo.ConcreteCount), " +
+    "Thunderbolt: $($tbEvents.Count), " +
+    "EDID: $($edid.Count)."
+
+Write-Host "`n$summaryMessage"
+
+# If a webhook URL was provided, post the results.
+if ($webhookUrl) {
+    Write-Host "`nPosting results to Discord webhook..." -ForegroundColor Cyan
+    $body = @{ content = $summaryMessage }
+    try {
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body ($body | ConvertTo-Json) -ContentType 'application/json'
+        Write-Host "Results posted to Discord webhook successfully." -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to post results to Discord webhook: $($_.Exception.Message)" -ForegroundColor Red
+    }
+} else {
+    Write-Host "`nNo webhook provided. Skipping Discord posting." -ForegroundColor Yellow
+}
+
+#endregion
